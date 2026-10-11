@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS distances (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    distance DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY (event_id) REFERENCES events(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

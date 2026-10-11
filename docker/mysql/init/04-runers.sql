@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS participants (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    start_number INT NOT NULL,
+    first_name VARCHAR(255) NOT NULL,
+    last_name VARCHAR(255) NOT NULL,
+    event_id INT NOT NULL,
+    distance_id INT NOT NULL,
+    addictional_text VARCHAR(255),
+    gender ENUM('M', 'F') NOT NULL,
+    birth_date DATE NOT NULL,
+    city VARCHAR(255) NOT NULL,
+    country VARCHAR(255) NOT NULL,
+    club VARCHAR(255),
+    email VARCHAR(255) NOT NULL,
+    phone_number VARCHAR(20),
+    disability BOOLEAN NOT NULL DEFAULT FALSE,
+    about_me TEXT,
+    FOREIGN KEY (event_id) REFERENCES events(id),
+    FOREIGN KEY (distance_id) REFERENCES events(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
