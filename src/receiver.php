@@ -16,9 +16,15 @@ declare(strict_types=1);
 const LISTEN_HOST = '0.0.0.0';
 const LISTEN_PORT = 61611;
 
-const DB_DSN  = 'mysql:host=localhost;dbname=chronotrack;charset=utf8mb4';
-const DB_USER = 'chrono_user';
-const DB_PASS = 'twoje_haslo';
+$host = getenv('DB_HOST') ?: 'mysql';
+$port = getenv('DB_PORT') ?: '3306';
+$db   = getenv('DB_NAME') ?: 'app_db';
+$user = getenv('DB_USER') ?: 'app_user';
+$pass = getenv('DB_PASSWORD') ?: 'app_password';
+
+define('DB_DSN', "mysql:host={$host};port={$port};dbname={$db};charset=utf8mb4");
+define('DB_USER', $user);
+define('DB_PASS', $pass);
 
 // Katalog na pliki WAL i bufor awaryjny
 const WAL_DIR = '/var/lib/chronotrack/wal';
@@ -64,17 +70,54 @@ function getPDO(): ?PDO
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
             PDO::ATTR_PERSISTENT         => true,
+            PDO::ATTR_TIMEOUT            => 5,
         ]);
 
         // Wymuś pełną trwałość na poziomie sesji (ACID)
         // innodb_flush_log_at_trx_commit = 1 oznacza flush redo log na każdy commit
         $pdo->exec("SET SESSION innodb_flush_log_at_trx_commit = 1");
         $pdo->exec("SET SESSION sync_binlog = 1");
+        $pdo->exec("SET SESSION wait_timeout = 28800");
 
         return $pdo;
     } catch (PDOException $e) {
         error_log("[DB] Błąd połączenia: " . $e->getMessage());
         return null;
+    }
+}
+
+/**
+ * Zwraca unikatowy identyfikator rekordu do wykrywania powtórzeń.
+ */
+function observationKey(array $fields, string $connectionId): string
+{
+    $sequence = (string) ($fields[1] ?? '');
+    $tag      = (string) ($fields[2] ?? '');
+    $reader   = (string) ($fields[6] ?? '');
+    $time     = (string) ($fields[5] ?? '');
+
+    return $sequence . '|' . $tag . '|' . $reader . '|' . $time;
+}
+
+/**
+ * Dodaje rekord do bufora pamięciowego z ochroną przed duplikatami.
+ */
+function enqueueMemoryRecord(array $fields, string $connectionId): void
+{
+    global $memoryBuffer;
+
+    $key = observationKey($fields, $connectionId);
+    foreach ($memoryBuffer as $item) {
+        if (observationKey($item['fields'], (string) $item['conn']) === $key) {
+            return;
+        }
+    }
+
+    $memoryBuffer[] = ['fields' => $fields, 'conn' => $connectionId, 'ts' => microtime(true)];
+
+    if (count($memoryBuffer) > MAX_MEMORY_BUFFER) {
+        array_shift($memoryBuffer);
+        error_log("[DB] Bufor pamięciowy przepełniony — najstarszy rekord odrzucony.");
     }
 }
 
@@ -133,14 +176,13 @@ function persistObservation(array $fields, string $connectionId): void
     // Krok 2: Spróbuj zapisać do bazy
     $pdo = getPDO();
     if ($pdo === null) {
-        // Baza niedostępna — zapisz w buforze pamięciowym
-        $memoryBuffer[] = ['fields' => $fields, 'conn' => $connectionId, 'ts' => microtime(true)];
+        enqueueMemoryRecord($fields, $connectionId);
         error_log("[DB] Baza niedostępna. Rekord w buforze pamięciowym. Bufor: " . count($memoryBuffer));
         return;
     }
 
     try {
-        $sql = "INSERT INTO tag_observations
+        $sql = "INSERT IGNORE INTO tag_observations
                 (sequence_number, tag_code, timer_code, event_code,
                  observation_time, reader_id, port_number, rssi,
                  reader_sequence, transaction_type, connection_id)
@@ -172,10 +214,9 @@ function persistObservation(array $fields, string $connectionId): void
         }
     } catch (PDOException $e) {
         error_log("[DB] Błąd INSERT: " . $e->getMessage());
-        $memoryBuffer[] = ['fields' => $fields, 'conn' => $connectionId, 'ts' => microtime(true)];
+        enqueueMemoryRecord($fields, $connectionId);
     }
 
-    // Zabezpieczenie przed przepełnieniem pamięci
     if (count($memoryBuffer) > MAX_MEMORY_BUFFER) {
         array_shift($memoryBuffer);
         error_log("[DB] Bufor pamięciowy przepełniony — najstarszy rekord odrzucony.");
@@ -191,7 +232,7 @@ function flushMemoryBuffer(PDO $pdo): void
 
     if (empty($memoryBuffer)) return;
 
-    $sql = "INSERT INTO tag_observations
+    $sql = "INSERT IGNORE INTO tag_observations
             (sequence_number, tag_code, timer_code, event_code,
              observation_time, reader_id, port_number, rssi,
              reader_sequence, transaction_type, connection_id)
@@ -203,9 +244,17 @@ function flushMemoryBuffer(PDO $pdo): void
     $stmt = $pdo->prepare($sql);
     $flushed = 0;
     $remaining = [];
+    $seen = [];
 
     foreach ($memoryBuffer as $item) {
         $f = $item['fields'];
+        $key = observationKey($f, (string) $item['conn']);
+
+        if (isset($seen[$key])) {
+            continue;
+        }
+        $seen[$key] = true;
+
         try {
             $stmt->execute([
                 ':seq'    => (int) $f[1],
@@ -230,6 +279,31 @@ function flushMemoryBuffer(PDO $pdo): void
     if ($flushed > 0) {
         error_log("[DB] Opróżniono bufor: $flushed rekordów zapisanych, " . count($memoryBuffer) . " pozostało.");
     }
+}
+
+/**
+ * Próbuje ponownie wysłać bufory do bazy według interwału retry.
+ */
+function maybeRetryDbFlush(): void
+{
+    global $lastDbRetry, $memoryBuffer;
+
+    if (empty($memoryBuffer)) {
+        return;
+    }
+
+    $now = time();
+    if (($now - $lastDbRetry) < DB_RETRY_INTERVAL) {
+        return;
+    }
+
+    $lastDbRetry = $now;
+    $pdo = getPDO();
+    if ($pdo === null) {
+        return;
+    }
+
+    flushMemoryBuffer($pdo);
 }
 
 /**
@@ -361,6 +435,8 @@ echo "Serwer CTP01 nasłuchuje na " . LISTEN_HOST . ":" . LISTEN_PORT . "\n";
 $clients = [];
 
 while (true) {
+    maybeRetryDbFlush();
+
     $read = [$server];
     foreach ($clients as $sock => $data) {
         $read[] = $sock;

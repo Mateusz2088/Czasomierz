@@ -16,5 +16,5 @@ CREATE TABLE IF NOT EXISTS participants (
     disability BOOLEAN NOT NULL DEFAULT FALSE,
     about_me TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id),
-    FOREIGN KEY (distance_id) REFERENCES events(id)
+    FOREIGN KEY (distance_id) REFERENCES distances(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
