@@ -1,4 +1,5 @@
 # Czasomierz
+Projekt jest jeszcze niegotowy.
 
 System do zbierania i przechowywania wyników z pomiarów czasu dla zawodów biegowych i eventów sportowych. Projekt wykorzystuje odbiornik ChronoTrack CTP01, który nasłuchuje na porcie TCP, zapisuje dane do bazy MySQL i utrzymuje trwałość odczytów za pomocą Write-Ahead Log (WAL).
 
@@ -175,9 +176,6 @@ W kolejnych etapach można dodać:
 - integrację z systemami wyników live,
 - automatyczne raportowanie i analitykę wyników.
 
-## 13. Kontakt i autorstwo
-
-Projekt jest przygotowany jako infrastruktura do obsługi pomiaru czasu i eventów sportowych w środowisku Docker. Jest zgodny z protokołem `CTP01` i może być rozwijany według potrzeb konkretnego eventu lub organizacji.
 
 ---
 
