@@ -1,3 +1,15 @@
+<?php
+session_start();
+include_once __DIR__ . '/DB_CLASS.php';
+
+if (isset($_GET['set_event'])) {
+    $_SESSION['current_event'] = htmlspecialchars($_GET['set_event']);
+    echo "<p>Ustawiono aktualne wydarzenie na: <strong>" . htmlspecialchars($_SESSION['current_event']) . "</strong></p>";
+}
+
+# Panel główny aplikacji – wyświetla panel nawigacyjny i statystyki
+
+?>
 <!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -10,34 +22,49 @@
     <header>
         <h1>Panel administratora aplikacji biegowej</h1>
         </header>
-    <nav>
-        <ul>
-            <li><a href="index.php">Strona główna</a></li>
-            <li><a href="testDb.php">Test połączenia z bazą danych</a></li>
-            <li><a href="manageInserts.php">Zarządzanie wpisami</a></li>
-            <li><a href="manageRaces.php">Zarządzanie biegami</a></li>
-            <li><a href="manageResults.php">Zarządzanie wynikami</a></li>
-            <li><a href="manageUsers.php">Zarządzanie biegaczami</a></li>
-        </ul>
-    </nav>
+        <? include __DIR__ . '/nav.php'; ?>
     <main>
+        <h2>Dane serwera</h2>
+        <p>PHP: <?php echo phpversion(); ?></p>
+        <p>IP: <?php echo $_SERVER['SERVER_ADDR']; ?></p>
+        <p>Port: <?php echo $_SERVER['SERVER_PORT']; ?></p>
+        <p>Czas pracy: <?php echo shell_exec('uptime'); ?></p>
+        <p>Nazwa hosta: <?php echo gethostname(); ?></p>
+        <p>Nazwa serwera: <?php echo $_SERVER['SERVER_NAME']; ?></p>
         <h2>Wydarzenie</h2>
-        <p>Aktualnie </p>
+        <p>Aktualnie trwające wydarzenie: <?php echo $_SESSION['current_event'] ?? 'Brak aktywnego wydarzenia'; ?></p>
+        <h2>Najbliższe wydarzenia</h2>
+        <?php
+            $events = DB::getEvents();
+            foreach ($events as $event) {
+                echo "<p>" . htmlspecialchars($event['event_name']) . " (" . htmlspecialchars($event['date_start']) . ")";
+                if ($event['date_end']) {
+                    echo " – " . htmlspecialchars($event['date_end']);
+                }
+                if (urlencode($event['EVENT_CODE'])==htmlspecialchars($_SESSION['current_event'])) {
+                    echo " <strong>(aktualne)</strong>";
+                }else {
+                    echo " <a href=\"?set_event=" . urlencode($event['EVENT_CODE']) . "\">Ustaw jako aktualne</a>";
+                }
+                echo "</p>";
+            }
+        ?>
+        <h2>Statystyki aktualnego wydarzenia</h2>
+        <?php
+            if (isset($_SESSION['current_event'])) {
 
-        <h2>Statystyki bazy danych</h2>
-<?php
+                echo "<p>Liczba biegaczy: " .DB::getRunnersCount($_SESSION['current_event']). "</p>";
+                echo "<p>Liczba wyników: " .count(DB::getTrackersCount($_SESSION['current_event'])) . "</p>";
+                echo "<ul>";
+                foreach (DB::getTrackersCount($_SESSION['current_event']) as $tracker) {
 
-$host = getenv('DB_HOST') ?: 'mysql';
-$port = getenv('DB_PORT') ?: '3306';
-$db   = getenv('DB_NAME') ?: 'app_db';
-$user = getenv('DB_USER') ?: 'app_user';
-$pass = getenv('DB_PASSWORD') ?: '';
-
-$dsn = "mysql:host=$host;port=$port;dbname=$db;charset=utf8mb4";
-
-# Panel główny aplikacji – wyświetla panel nawigacyjny i statystyki
-
-?>
+                    echo "<li>" . htmlspecialchars($tracker['first_name']) . " " . htmlspecialchars($tracker['last_name']) . " - " . htmlspecialchars($tracker['lap']) . " okrążeń z " . htmlspecialchars($tracker['KmPerLap']) . "</li>";
+                }
+                echo "</ul>";
+            } else {
+                echo "<p>Brak aktywnego wydarzenia. Ustaw aktualne wydarzenie, aby zobaczyć statystyki.</p>";
+            }
+        ?>
     </main>
     </body>
     </html> 
