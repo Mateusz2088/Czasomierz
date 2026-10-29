@@ -171,11 +171,40 @@ class DB
                 WHERE event_id=events.id AND events.EVENT_CODE=:code ;';
         return self::fetchAll($sql, ['code' => $eventCode]);
     }
+
     public static function getLapList(string $eventCode): array
     {
-        $sql = 'SELECT * FROM `EventListOfLaps` 
-        WHERE event_code = :code 
-        ORDER by observation_time DESC;';
+        $sql = 'SELECT tg.id, tg.tag_code, tg.observation_time,
+                       p.start_number, p.first_name, p.last_name,
+                       d.distance, d.KmPerLap
+                FROM tag_observations AS tg
+                LEFT JOIN chip AS c ON c.chip_number = tg.tag_code
+                LEFT JOIN participants AS p ON p.id = c.participant_id
+                LEFT JOIN distances AS d ON d.id = p.distance_id
+                WHERE tg.event_code = :code
+                ORDER BY tg.observation_time DESC';
+
         return self::fetchAll($sql, ['code' => $eventCode]);
+    }
+
+    public static function getDistancesByEvent(int $eventId): array
+    {
+        return self::fetchAll(
+            'SELECT * FROM distances WHERE event_id = :event_id ORDER BY distance ASC',
+            ['event_id' => $eventId]
+        );
+    }
+
+    public static function getParticipantsByEvent(int $eventId): array
+    {
+        return self::fetchAll(
+            'SELECT p.*, e.event_name, d.distance
+             FROM participants AS p
+             LEFT JOIN events AS e ON e.id = p.event_id
+             LEFT JOIN distances AS d ON d.id = p.distance_id
+             WHERE p.event_id = :event_id
+             ORDER BY p.start_number ASC, p.last_name ASC, p.first_name ASC',
+            ['event_id' => $eventId]
+        );
     }
 }

@@ -8,3 +8,158 @@
     padding: 8px;
     text-align: center;
 }
+
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    background: #f5f7fb;
+    color: #1f2937;
+}
+
+header {
+    background: #0f172a;
+    color: white;
+    padding: 1rem 2rem;
+}
+
+nav {
+    background: #e2e8f0;
+    padding: 0.75rem 2rem;
+}
+
+nav ul {
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin: 0;
+    padding: 0;
+}
+
+nav a {
+    color: #0f172a;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+main {
+    padding: 1.5rem 2rem 3rem;
+}
+
+.filterForm,
+.runnerForm {
+    background: #ffffff;
+    border: 1px solid #dfe7f1;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem;
+}
+
+.formGrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+}
+
+label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    font-weight: 600;
+}
+
+input,
+select,
+textarea,
+button {
+    font: inherit;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+}
+
+textarea {
+    resize: vertical;
+    min-height: 90px;
+}
+
+.checkboxLabel {
+    flex-direction: row !important;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 1.25rem;
+}
+
+.checkboxLabel input {
+    width: auto;
+    margin: 0;
+}
+
+.fullWidth {
+    grid-column: 1 / -1;
+}
+
+.actions,
+.tableActions {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+button,
+.secondaryButton {
+    background: #2563eb;
+    color: white;
+    text-decoration: none;
+    border: none;
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.secondaryButton {
+    background: #64748b;
+    padding: 0.7rem 0.95rem;
+    display: inline-block;
+}
+
+.runnerTable {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+    border: 1px solid #dfe7f1;
+}
+
+.runnerTable th,
+.runnerTable td {
+    border-bottom: 1px solid #e2e8f0;
+    padding: 0.65rem 0.5rem;
+    text-align: left;
+    vertical-align: top;
+}
+
+.runnerTable th {
+    background: #f8fafc;
+}
+
+.alert {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    color: #991b1b;
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+}
+
+@media (max-width: 768px) {
+    main {
+        padding: 1rem;
+    }
+
+    nav {
+        padding: 0.75rem 1rem;
+    }
+
+    nav ul {
+        gap: 0.5rem;
+    }
+}
