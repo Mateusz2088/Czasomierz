@@ -19,3 +19,6 @@ CREATE TABLE IF NOT EXISTS tag_observations (
     UNIQUE INDEX idx_unique_obs
         (sequence_number, tag_code, reader_id, observation_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_tag_obs_event_tag_time
+  ON tag_observations(event_code, tag_code, observation_time);

@@ -197,6 +197,82 @@ class DB
         );
     }
 
+    public static function getAgeCategoriesByEvent(int $eventId): array
+    {
+        return self::fetchAll(
+            'SELECT * FROM event_age_categories
+             WHERE event_id = :event_id
+             ORDER BY min_age ASC, max_age ASC, category_name ASC',
+            ['event_id' => $eventId]
+        );
+    }
+
+    public static function ageCategoryRangeOverlaps(
+        int $eventId,
+        int $minAge,
+        ?int $maxAge,
+        ?int $excludeCategoryId = null
+    ): bool {
+        $sql = 'SELECT id FROM event_age_categories WHERE event_id = :event_id';
+        $params = ['event_id' => $eventId];
+
+        if ($maxAge === null) {
+            $sql .= ' AND (max_age IS NULL OR max_age >= :new_min_age)';
+        } else {
+            $sql .= ' AND min_age <= :new_max_age
+                      AND (max_age IS NULL OR max_age >= :new_min_age)';
+            $params['new_max_age'] = $maxAge;
+        }
+        $params['new_min_age'] = $minAge;
+
+        if ($excludeCategoryId !== null) {
+            $sql .= ' AND id <> :exclude_id';
+            $params['exclude_id'] = $excludeCategoryId;
+        }
+
+        return self::fetchOne($sql, $params) !== null;
+    }
+
+    public static function saveAgeCategory(
+        int $eventId,
+        string $name,
+        int $minAge,
+        ?int $maxAge,
+        ?int $categoryId = null
+    ): void {
+        $params = [
+            'event_id' => $eventId,
+            'category_name' => $name,
+            'min_age' => $minAge,
+            'max_age' => $maxAge,
+        ];
+
+        if ($categoryId === null) {
+            self::execute(
+                'INSERT INTO event_age_categories (event_id, category_name, min_age, max_age)
+                 VALUES (:event_id, :category_name, :min_age, :max_age)',
+                $params
+            );
+            return;
+        }
+
+        $params['id'] = $categoryId;
+        self::execute(
+            'UPDATE event_age_categories
+             SET category_name = :category_name, min_age = :min_age, max_age = :max_age
+             WHERE id = :id AND event_id = :event_id',
+            $params
+        );
+    }
+
+    public static function deleteAgeCategory(int $eventId, int $categoryId): void
+    {
+        self::execute(
+            'DELETE FROM event_age_categories WHERE id = :id AND event_id = :event_id',
+            ['id' => $categoryId, 'event_id' => $eventId]
+        );
+    }
+
     public static function getManagementEvents(): array
     {
         return self::fetchAll('SELECT * FROM events ORDER BY date_start DESC');
@@ -367,14 +443,7 @@ class DB
                            c.chip_number,
                            p.distance_id,
                            d.distance AS distance_km,
-                           CASE
-                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 18 THEN \'U18\'
-                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 30 THEN \'18-29\'
-                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 40 THEN \'30-39\'
-                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 50 THEN \'40-49\'
-                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 60 THEN \'50-59\'
-                               ELSE \'60+\'
-                           END AS age_category,
+                           COALESCE(ac.category_name, \'Bez kategorii\') AS age_category,
                            pr.start_time,
                            pr.finish_time,
                            pr.finish_time - pr.start_time AS elapsed_s
@@ -383,6 +452,10 @@ class DB
                     INNER JOIN chip AS c ON c.participant_id = p.id
                     INNER JOIN distances AS d ON d.id = p.distance_id
                     INNER JOIN events AS e ON e.id = p.event_id
+                    LEFT JOIN event_age_categories AS ac
+                        ON ac.event_id = p.event_id
+                       AND TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) >= ac.min_age
+                       AND (ac.max_age IS NULL OR TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) <= ac.max_age)
                     WHERE pr.finish_time IS NOT NULL
                       AND pr.crossings_cnt >= pr.laps_needed + 1
                 )

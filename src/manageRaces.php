@@ -15,6 +15,7 @@ $message = '';
 $selectedEventId = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT) ?: null;
 $raceEditId = filter_input(INPUT_GET, 'edit_race', FILTER_VALIDATE_INT) ?: null;
 $distanceEditId = filter_input(INPUT_GET, 'edit_distance', FILTER_VALIDATE_INT) ?: null;
+$categoryEditId = filter_input(INPUT_GET, 'edit_category', FILTER_VALIDATE_INT) ?: null;
 
 $formRace = [
     'event_name' => '',
@@ -28,6 +29,11 @@ $formDistance = [
     'event_id' => '',
     'distance' => '',
     'KmPerLap' => '',
+];
+$formCategory = [
+    'category_name' => '',
+    'min_age' => '0',
+    'max_age' => '',
 ];
 
 $events = DB::fetchAll('SELECT * FROM events ORDER BY date_start DESC');
@@ -43,6 +49,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     try {
         if (!hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
             throw new RuntimeException('Nieprawidłowy token formularza.');
+        }
+
+        if (in_array($action, ['category_add', 'category_update', 'category_delete'], true)) {
+            $eventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT) ?: null;
+            $categoryId = filter_input(INPUT_POST, 'category_id', FILTER_VALIDATE_INT) ?: null;
+            if (!$eventId) {
+                throw new RuntimeException('Wybierz wydarzenie dla kategorii wiekowej.');
+            }
+
+            if ($action === 'category_delete') {
+                if (!$categoryId) {
+                    throw new RuntimeException('Nieprawidłowy identyfikator kategorii.');
+                }
+                DB::deleteAgeCategory($eventId, $categoryId);
+            } else {
+                $formCategory = array_merge($formCategory, $_POST);
+                $categoryName = trim((string) ($_POST['category_name'] ?? ''));
+                $minAge = filter_var($_POST['min_age'] ?? null, FILTER_VALIDATE_INT);
+                $maxAgeInput = trim((string) ($_POST['max_age'] ?? ''));
+                $maxAge = $maxAgeInput === '' ? null : filter_var($maxAgeInput, FILTER_VALIDATE_INT);
+
+                if ($categoryName === '' || strlen($categoryName) > 80) {
+                    throw new RuntimeException('Nazwa kategorii jest wymagana i może mieć maksymalnie 80 znaków.');
+                }
+                if ($minAge === false || $minAge < 0 || $minAge > 150) {
+                    throw new RuntimeException('Wiek od musi być liczbą całkowitą od 0 do 150.');
+                }
+                if ($maxAgeInput !== '' && ($maxAge === false || $maxAge < $minAge || $maxAge > 150)) {
+                    throw new RuntimeException('Wiek do musi być pusty albo liczbą od wieku początkowego do 150.');
+                }
+                if (DB::ageCategoryRangeOverlaps($eventId, $minAge, $maxAge, $action === 'category_update' ? $categoryId : null)) {
+                    throw new RuntimeException('Przedział wieku nakłada się na inną kategorię tego wydarzenia.');
+                }
+                if ($action === 'category_update' && !$categoryId) {
+                    throw new RuntimeException('Nieprawidłowy identyfikator kategorii.');
+                }
+
+                DB::saveAgeCategory(
+                    $eventId,
+                    $categoryName,
+                    $minAge,
+                    $maxAge,
+                    $action === 'category_update' ? $categoryId : null
+                );
+            }
+
+            header('Location: manageRaces.php?event_id=' . $eventId);
+            exit;
         }
 
         if ($action === 'race_add' || $action === 'race_update') {
@@ -203,6 +257,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $formRace = array_merge($formRace, $_POST);
         $formDistance = array_merge($formDistance, $_POST);
+        $formCategory = array_merge($formCategory, $_POST);
+        $selectedEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT) ?: $selectedEventId;
+        if (($action ?? '') === 'category_update') {
+            $categoryEditId = filter_input(INPUT_POST, 'category_id', FILTER_VALIDATE_INT) ?: null;
+        }
     }
 }
 
@@ -239,6 +298,16 @@ $distanceList = $selectedEventId !== null ? DB::fetchAll(
     'SELECT * FROM distances WHERE event_id = :event_id ORDER BY distance ASC',
     ['event_id' => $selectedEventId]
 ) : [];
+$ageCategories = $selectedEventId !== null ? DB::getAgeCategoriesByEvent($selectedEventId) : [];
+
+if ($categoryEditId && $_SERVER['REQUEST_METHOD'] !== 'POST') {
+    foreach ($ageCategories as $category) {
+        if ((int) $category['id'] === $categoryEditId) {
+            $formCategory = array_merge($formCategory, $category);
+            break;
+        }
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="pl">
@@ -424,6 +493,81 @@ $distanceList = $selectedEventId !== null ? DB::fetchAll(
                 </table>
             <?php else: ?>
                 <p>Brak aktywnego wydarzenia.</p>
+            <?php endif; ?>
+        </section>
+
+        <section class="filterForm">
+            <h2><?= $categoryEditId ? 'Edytuj kategorię wiekową' : 'Dodaj kategorię wiekową' ?></h2>
+            <?php if ($selectedEventId !== null): ?>
+                <form method="post">
+                    <input type="hidden" name="csrf_token" value="<?= h($_SESSION['csrf_token']) ?>">
+                    <input type="hidden" name="action" value="<?= $categoryEditId ? 'category_update' : 'category_add' ?>">
+                    <input type="hidden" name="event_id" value="<?= h((string) $selectedEventId) ?>">
+                    <?php if ($categoryEditId): ?>
+                        <input type="hidden" name="category_id" value="<?= h((string) $categoryEditId) ?>">
+                    <?php endif; ?>
+
+                    <div class="formGrid">
+                        <label>
+                            Nazwa kategorii
+                            <input type="text" name="category_name" maxlength="80" required value="<?= h($formCategory['category_name']) ?>" placeholder="np. 30–39 lat">
+                        </label>
+                        <label>
+                            Wiek od
+                            <input type="number" name="min_age" min="0" max="150" step="1" required value="<?= h($formCategory['min_age']) ?>">
+                        </label>
+                        <label>
+                            Wiek do (opcjonalnie)
+                            <input type="number" name="max_age" min="0" max="150" step="1" value="<?= h($formCategory['max_age']) ?>" placeholder="Bez górnego limitu">
+                        </label>
+                    </div>
+                    <p>Granice przedziału są włączne. Puste pole „Wiek do” oznacza brak górnego limitu.</p>
+                    <div class="actions">
+                        <button type="submit"><?= $categoryEditId ? 'Zapisz kategorię' : 'Dodaj kategorię' ?></button>
+                        <?php if ($categoryEditId): ?>
+                            <a href="manageRaces.php?event_id=<?= h((string) $selectedEventId) ?>" class="secondaryButton">Anuluj</a>
+                        <?php endif; ?>
+                    </div>
+                </form>
+
+                <h3>Kategorie wiekowe wydarzenia</h3>
+                <?php if ($ageCategories !== []): ?>
+                    <table class="runnerTable">
+                        <thead>
+                        <tr>
+                            <th>Nazwa</th>
+                            <th>Wiek od</th>
+                            <th>Wiek do</th>
+                            <th>Akcje</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach ($ageCategories as $category): ?>
+                            <tr>
+                                <td><?= h($category['category_name']) ?></td>
+                                <td><?= h((string) $category['min_age']) ?></td>
+                                <td><?= $category['max_age'] === null ? 'Bez limitu' : h((string) $category['max_age']) ?></td>
+                                <td>
+                                    <div class="tableActions">
+                                        <a href="?event_id=<?= h((string) $selectedEventId) ?>&edit_category=<?= h((string) $category['id']) ?>">Edytuj</a>
+                                        <form method="post" onsubmit="return confirm('Usunąć tę kategorię wiekową?');">
+                                            <input type="hidden" name="csrf_token" value="<?= h($_SESSION['csrf_token']) ?>">
+                                            <input type="hidden" name="action" value="category_delete">
+                                            <input type="hidden" name="event_id" value="<?= h((string) $selectedEventId) ?>">
+                                            <input type="hidden" name="category_id" value="<?= h((string) $category['id']) ?>">
+                                            <button type="submit">Usuń</button>
+                                        </form>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php else: ?>
+                    <p>Brak kategorii wiekowych dla tego wydarzenia.</p>
+                <?php endif; ?>
+            <?php else: ?>
+                <p>Najpierw wybierz lub dodaj wydarzenie.</p>
             <?php endif; ?>
         </section>
     <?php else: ?>

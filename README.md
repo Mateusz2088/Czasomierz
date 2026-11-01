@@ -79,7 +79,16 @@ Skrypty w katalogu `docker/mysql/init` tworzą następujące tabele:
 - `events` – definicje zawodów / eventów,
 - `distances` – dystanse przypisane do wydarzenia,
 - `participants` – uczestnicy zawodów,
-- `chip` – przypisanie chipów do zawodników.
+- `chip` – przypisanie chipów do zawodników,
+- `event_age_categories` – kategorie wiekowe i ich zakresy przypisane do wydarzeń.
+
+Kategorie wiekowe dodaje się, edytuje i usuwa w panelu wydarzeń. Przedziały są domknięte z obu stron; puste „Wiek do” oznacza brak górnego limitu. Zakresy kategorii w obrębie jednego wydarzenia nie mogą się nakładać.
+
+Skrypty z `docker/mysql/init` są uruchamiane automatycznie tylko przy pierwszym tworzeniu wolumenu MySQL. Aby dodać tabelę kategorii do już działającej bazy, wykonaj z katalogu projektu:
+
+```bash
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' < docker/mysql/init/06-event-age-categories.sql
+```
 
 Najważniejsza tabela to `tag_observations`, która przechowuje:
 
