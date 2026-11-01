@@ -142,6 +142,22 @@ button,
     background: #f8fafc;
 }
 
+.sortButton {
+    background: transparent;
+    color: inherit;
+    border: 0;
+    padding: 0;
+    text-align: left;
+}
+
+.tableScroll {
+    overflow-x: auto;
+}
+
+.tableScroll .runnerTable {
+    min-width: 900px;
+}
+
 .alert {
     background: #fef2f2;
     border: 1px solid #fecaca;

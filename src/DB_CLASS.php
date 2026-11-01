@@ -326,4 +326,79 @@ class DB
             throw $e;
         }
     }
+    public static function rankedIndividual(int $eventId): array
+    {
+        $sql = 'WITH ranked AS (
+                    SELECT p.id AS participant_id,
+                           p.event_id,
+                           t.observation_time AS ts,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY p.id
+                               ORDER BY t.observation_time, t.id
+                           ) AS rn
+                    FROM tag_observations AS t
+                    INNER JOIN chip AS c ON c.chip_number = t.tag_code
+                    INNER JOIN participants AS p ON p.id = c.participant_id
+                    WHERE p.event_id = :event_id
+                ),
+                per_runner AS (
+                    SELECT r.participant_id,
+                           MAX(CASE WHEN r.rn = 1 THEN r.ts END) AS start_time,
+                           MAX(
+                               CASE
+                                   WHEN r.rn = CAST(d.KmPerLap AS UNSIGNED) + 1 THEN r.ts
+                               END
+                           ) AS finish_time,
+                           COUNT(*) AS crossings_cnt,
+                           CAST(d.KmPerLap AS UNSIGNED) AS laps_needed
+                    FROM ranked AS r
+                    INNER JOIN participants AS p ON p.id = r.participant_id
+                    INNER JOIN distances AS d ON d.id = p.distance_id
+                    WHERE d.KmPerLap > 0
+                    GROUP BY r.participant_id, d.distance, d.KmPerLap
+                ),
+                finishers AS (
+                    SELECT p.id AS participant_id,
+                           p.start_number,
+                           p.first_name,
+                           p.last_name,
+                           p.gender,
+                           p.club,
+                           c.chip_number,
+                           p.distance_id,
+                           d.distance AS distance_km,
+                           CASE
+                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 18 THEN \'U18\'
+                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 30 THEN \'18-29\'
+                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 40 THEN \'30-39\'
+                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 50 THEN \'40-49\'
+                               WHEN TIMESTAMPDIFF(YEAR, p.birth_date, e.date_start) < 60 THEN \'50-59\'
+                               ELSE \'60+\'
+                           END AS age_category,
+                           pr.start_time,
+                           pr.finish_time,
+                           pr.finish_time - pr.start_time AS elapsed_s
+                    FROM per_runner AS pr
+                    INNER JOIN participants AS p ON p.id = pr.participant_id
+                    INNER JOIN chip AS c ON c.participant_id = p.id
+                    INNER JOIN distances AS d ON d.id = p.distance_id
+                    INNER JOIN events AS e ON e.id = p.event_id
+                    WHERE pr.finish_time IS NOT NULL
+                      AND pr.crossings_cnt >= pr.laps_needed + 1
+                )
+                SELECT f.*,
+                       RANK() OVER (
+                           PARTITION BY f.distance_id, f.age_category, f.gender
+                           ORDER BY f.elapsed_s
+                       ) AS place_age_gender,
+                       RANK() OVER (
+                           PARTITION BY f.distance_id
+                           ORDER BY f.elapsed_s
+                       ) AS place_open
+                FROM finishers AS f
+                ORDER BY f.distance_km, f.age_category, f.gender, f.elapsed_s';
+
+        return self::fetchAll($sql, ['event_id' => $eventId]);
+    }
+
 }
