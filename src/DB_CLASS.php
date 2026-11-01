@@ -109,8 +109,10 @@ class DB
      */
     public static function insert(string $sql, array $params = []): int
     {
-        self::execute($sql, $params);
-        return (int) self::getConnection()->lastInsertId();
+        $pdo = self::getConnection();
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        return (int) $pdo->lastInsertId();
     }
 
     /**
@@ -195,16 +197,133 @@ class DB
         );
     }
 
-    public static function getParticipantsByEvent(int $eventId): array
+    public static function getManagementEvents(): array
     {
-        return self::fetchAll(
-            'SELECT p.*, e.event_name, d.distance
+        return self::fetchAll('SELECT * FROM events ORDER BY date_start DESC');
+    }
+
+    public static function getParticipantForManagement(int $participantId): ?array
+    {
+        return self::fetchOne(
+            'SELECT p.*,
+                    (SELECT c.chip_number
+                     FROM chip AS c
+                     WHERE c.participant_id = p.id
+                     ORDER BY c.chip_number ASC
+                     LIMIT 1) AS chip_number
              FROM participants AS p
-             LEFT JOIN events AS e ON e.id = p.event_id
-             LEFT JOIN distances AS d ON d.id = p.distance_id
-             WHERE p.event_id = :event_id
-             ORDER BY p.start_number ASC, p.last_name ASC, p.first_name ASC',
-            ['event_id' => $eventId]
+             WHERE p.id = :id',
+            ['id' => $participantId]
         );
+    }
+
+    public static function getParticipantsForManagement(?int $eventId = null): array
+    {
+        $sql = 'SELECT p.*, e.event_name, d.distance,
+                       (SELECT c.chip_number
+                        FROM chip AS c
+                        WHERE c.participant_id = p.id
+                        ORDER BY c.chip_number ASC
+                        LIMIT 1) AS chip_number
+                FROM participants AS p
+                LEFT JOIN events AS e ON e.id = p.event_id
+                LEFT JOIN distances AS d ON d.id = p.distance_id';
+        $params = [];
+
+        if ($eventId !== null) {
+            $sql .= ' WHERE p.event_id = :event_id';
+            $params['event_id'] = $eventId;
+        }
+
+        $sql .= ' ORDER BY p.start_number ASC, p.last_name ASC, p.first_name ASC';
+
+        return self::fetchAll($sql, $params);
+    }
+
+    public static function saveParticipantForManagement(array $params, ?int $participantId, ?string $chipNumber): int
+    {
+        self::beginTransaction();
+
+        try {
+            if ($participantId === null) {
+                $participantId = self::insert(
+                    'INSERT INTO participants (
+                        start_number, first_name, last_name, event_id, distance_id, addictional_text,
+                        gender, birth_date, city, country, club, email, phone_number, disability, about_me
+                    ) VALUES (
+                        :start_number, :first_name, :last_name, :event_id, :distance_id, :addictional_text,
+                        :gender, :birth_date, :city, :country, :club, :email, :phone_number, :disability, :about_me
+                    )',
+                    $params
+                );
+            } else {
+                $params['id'] = $participantId;
+                self::execute(
+                    'UPDATE participants SET
+                        start_number = :start_number,
+                        first_name = :first_name,
+                        last_name = :last_name,
+                        event_id = :event_id,
+                        distance_id = :distance_id,
+                        addictional_text = :addictional_text,
+                        gender = :gender,
+                        birth_date = :birth_date,
+                        city = :city,
+                        country = :country,
+                        club = :club,
+                        email = :email,
+                        phone_number = :phone_number,
+                        disability = :disability,
+                        about_me = :about_me
+                     WHERE id = :id',
+                    $params
+                );
+            }
+
+            if ($participantId < 1 || self::fetchOne(
+                'SELECT id FROM participants WHERE id = :id',
+                ['id' => $participantId]
+            ) === null) {
+                throw new RuntimeException('Nie znaleziono zapisanego zawodnika do przypisania chipu.');
+            }
+
+            self::execute(
+                'DELETE FROM chip WHERE participant_id = :participant_id',
+                ['participant_id' => $participantId]
+            );
+            if ($chipNumber !== null && $chipNumber !== '') {
+                self::execute(
+                    'INSERT INTO chip (chip_number, participant_id) VALUES (:chip_number, :participant_id)',
+                    ['chip_number' => $chipNumber, 'participant_id' => $participantId]
+                );
+            }
+
+            self::commit();
+            return $participantId;
+        } catch (Throwable $e) {
+            if (self::getConnection()->inTransaction()) {
+                self::rollBack();
+            }
+            throw $e;
+        }
+    }
+
+    public static function deleteParticipantForManagement(int $participantId): void
+    {
+        self::beginTransaction();
+
+        try {
+            self::execute(
+                'DELETE FROM chip WHERE participant_id = :participant_id',
+                ['participant_id' => $participantId]
+            );
+            self::execute('DELETE FROM participants WHERE id = :id', ['id' => $participantId]);
+            self::commit();
+        } catch (Throwable $e) {
+            if (self::getConnection()->inTransaction()) {
+                self::rollBack();
+            }
+            throw $e;
+        }
     }
 }

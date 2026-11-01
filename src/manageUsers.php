@@ -31,9 +31,10 @@ $formValues = [
     'phone_number' => '',
     'disability' => '0',
     'about_me' => '',
+    'chip_number' => '',
 ];
 
-$events = DB::fetchAll('SELECT * FROM events ORDER BY date_start DESC');
+$events = DB::getManagementEvents();
 if ($selectedEventId === null && !empty($events)) {
     $selectedEventId = (int) $events[0]['id'];
 }
@@ -61,7 +62,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 throw new RuntimeException('Nieprawidłowy identyfikator zawodnika.');
             }
 
-            DB::execute('DELETE FROM participants WHERE id = :id', ['id' => $editId]);
+            DB::deleteParticipantForManagement($editId);
             header('Location: manageUsers.php' . ($eventId ? '?event_id=' . (int)$eventId : ''));
             exit;
         }
@@ -112,6 +113,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $club = trim((string) ($_POST['club'] ?? ''));
         $additionalText = trim((string) ($_POST['addictional_text'] ?? ''));
         $aboutMe = trim((string) ($_POST['about_me'] ?? ''));
+        $chipNumber = trim((string) ($_POST['chip_number'] ?? ''));
+        if (strlen($chipNumber) > 255) {
+            throw new RuntimeException('Numer chipu nie może przekraczać 255 znaków.');
+        }
 
         $params = [
             'start_number' => $startNumber,
@@ -131,44 +136,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'about_me' => $aboutMe !== '' ? $aboutMe : null,
         ];
 
-        if ($action === 'add') {
-            DB::execute(
-                'INSERT INTO participants (
-                    start_number, first_name, last_name, event_id, distance_id, addictional_text,
-                    gender, birth_date, city, country, club, email, phone_number, disability, about_me
-                ) VALUES (
-                    :start_number, :first_name, :last_name, :event_id, :distance_id, :addictional_text,
-                    :gender, :birth_date, :city, :country, :club, :email, :phone_number, :disability, :about_me
-                )',
-                $params
-            );
-        } else {
-            if (!$editId) {
-                throw new RuntimeException('Nieprawidłowy identyfikator zawodnika.');
-            }
-
-            $params['id'] = $editId;
-            DB::execute(
-                'UPDATE participants SET
-                    start_number = :start_number,
-                    first_name = :first_name,
-                    last_name = :last_name,
-                    event_id = :event_id,
-                    distance_id = :distance_id,
-                    addictional_text = :addictional_text,
-                    gender = :gender,
-                    birth_date = :birth_date,
-                    city = :city,
-                    country = :country,
-                    club = :club,
-                    email = :email,
-                    phone_number = :phone_number,
-                    disability = :disability,
-                    about_me = :about_me
-                 WHERE id = :id',
-                $params
-            );
+        if ($action === 'update' && !$editId) {
+            throw new RuntimeException('Nieprawidłowy identyfikator zawodnika.');
         }
+
+        DB::saveParticipantForManagement($params, $action === 'update' ? $editId : null, $chipNumber !== '' ? $chipNumber : null);
 
         $redirectEventId = $eventId ?: $selectedEventId;
         header('Location: manageUsers.php' . ($redirectEventId ? '?event_id=' . (int) $redirectEventId : ''));
@@ -183,7 +155,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 if ($editId && $_SERVER['REQUEST_METHOD'] !== 'POST') {
-    $participant = DB::fetchOne('SELECT * FROM participants WHERE id = :id', ['id' => $editId]);
+    $participant = DB::getParticipantForManagement($editId);
     if ($participant) {
         $formValues = array_merge($formValues, $participant);
         $selectedEventId = (int) $participant['event_id'];
@@ -194,13 +166,7 @@ if ($editId && $_SERVER['REQUEST_METHOD'] !== 'POST') {
     }
 }
 
-$participants = $selectedEventId !== null ? DB::getParticipantsByEvent($selectedEventId) : DB::fetchAll(
-    'SELECT p.*, e.event_name, d.distance
-     FROM participants AS p
-     LEFT JOIN events AS e ON e.id = p.event_id
-     LEFT JOIN distances AS d ON d.id = p.distance_id
-     ORDER BY p.start_number ASC, p.last_name ASC, p.first_name ASC'
-);
+$participants = DB::getParticipantsForManagement($selectedEventId);
 ?>
 <!DOCTYPE html>
 <html lang="pl">
@@ -315,7 +281,7 @@ $participants = $selectedEventId !== null ? DB::getParticipantsByEvent($selected
 
                 <label>
                     E-mail
-                    <input type="email" name="email" required value="<?= h($formValues['email']) ?>">
+                    <input type="email" name="email" value="<?= h($formValues['email']) ?>">
                 </label>
 
                 <label>
@@ -332,6 +298,10 @@ $participants = $selectedEventId !== null ? DB::getParticipantsByEvent($selected
                     O mnie
                     <textarea name="about_me" rows="4"><?= h($formValues['about_me']) ?></textarea>
                 </label>
+                <label>
+                    Numer chipu
+                    <input type="text" name="chip_number" value="<?= h($formValues['chip_number']) ?>">
+                </label>
             </div>
 
             <div class="actions">
@@ -347,6 +317,7 @@ $participants = $selectedEventId !== null ? DB::getParticipantsByEvent($selected
             <thead>
             <tr>
                 <th>Nr</th>
+                <th>Chip</th>
                 <th>Imię</th>
                 <th>Nazwisko</th>
                 <th>Wydarzenie</th>
@@ -366,6 +337,7 @@ $participants = $selectedEventId !== null ? DB::getParticipantsByEvent($selected
             <?php foreach ($participants as $participant): ?>
                 <tr>
                     <td><?= h($participant['start_number']) ?></td>
+                    <td><?= h($participant['chip_number'] ?? '') ?></td>
                     <td><?= h($participant['first_name']) ?></td>
                     <td><?= h($participant['last_name']) ?></td>
                     <td><?= h($participant['event_name'] ?? '') ?></td>
