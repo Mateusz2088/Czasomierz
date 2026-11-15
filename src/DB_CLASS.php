@@ -167,6 +167,34 @@ class DB
         return self::fetchAll($sql, ['code' => $eventCode]);
     }
 
+    public static function getDistanceRunnerStats(string $eventCode): array
+    {
+        $sql = 'SELECT d.distance,
+                       COUNT(p.id) AS total_runners,
+                       SUM(CASE
+                               WHEN COALESCE(t.lap, 0) > 0 AND d.KmPerLap > t.lap - 1 THEN 1
+                               ELSE 0
+                           END) AS runners_on_route
+                FROM events AS e
+                JOIN distances AS d ON d.event_id = e.id
+                LEFT JOIN participants AS p ON p.distance_id = d.id AND p.event_id = e.id
+                LEFT JOIN (
+                    SELECT c.participant_id, COUNT(tg.tag_code) AS lap
+                    FROM chip AS c
+                    JOIN tag_observations AS tg ON tg.tag_code = c.chip_number
+                    WHERE tg.event_code = :observations_code
+                    GROUP BY c.participant_id
+                ) AS t ON t.participant_id = p.id
+                WHERE e.EVENT_CODE = :event_code
+                GROUP BY d.id, d.distance, d.KmPerLap
+                ORDER BY d.distance';
+
+        return self::fetchAll($sql, [
+            'observations_code' => $eventCode,
+            'event_code' => $eventCode,
+        ]);
+    }
+
     public static function getLapDistance(string $eventCode): array
     {
         $sql = 'SELECT distance, KmPerLap FROM `distances`, events 
