@@ -1,13 +1,18 @@
 <?php
 /**
- * ChronoTrack CTP01 Receiver Server — wersja odporna na awarie
+ * ChronoTrack CTP01 Receiver Server — wersja poprawiona
  *
- * Główne zabezpieczenia:
- *  1. Write-Ahead Log (WAL) — każdy odebrany odczyt jest najpierw zapisywany
- *     do pliku na dysku (fsync), zanim trafi do bazy danych.
- *  2. Transakcje MySQL z poziomem izolacji i flush na commit.
- *  3. Bufor w pamięci + ponowne próby zapisu w przypadku niedostępności bazy.
- *  4. Obsługa zerwania połączenia z klientem i wznowienie strumienia.
+ * Naprawione problemy:
+ *  - Przejście fazy initializing -> active (obsługa getconnectionid / ack-start).
+ *  - WAL w formacie JSON-lines (odporne na znaki specjalne w polach).
+ *  - Okresowy checkpoint WAL (plik nie rośnie w nieskończoność).
+ *  - Deduplikacja bufora pamięci w O(1).
+ *  - Walidacja pól ramki TO~.
+ *  - Timeout bezczynnego klienta.
+ *  - Graceful shutdown obsługiwany przez pcntl (jeśli dostępne).
+ *
+ * UWAGA: format WAL został zmieniony z "pola~pola~..." na JSON-lines,
+ *        więc stare pliki .wal nie będą odczytywane po aktualizacji.
  */
 
 declare(strict_types=1);
@@ -26,30 +31,40 @@ define('DB_DSN', "mysql:host={$host};port={$port};dbname={$db};charset=utf8mb4")
 define('DB_USER', $user);
 define('DB_PASS', $pass);
 
-// Katalog na pliki WAL i bufor awaryjny
-const WAL_DIR = '/var/lib/chronotrack/wal';
-const WAL_FILE = WAL_DIR . '/observations.wal';
+const WAL_DIR       = '/var/lib/chronotrack/wal';
+const WAL_FILE      = WAL_DIR . '/observations.wal';
 
-// Co ile sekund ponawiać próbę zapisu do bazy, jeśli poprzednia się nie udała
-const DB_RETRY_INTERVAL = 5;
+const DB_RETRY_INTERVAL       = 5;                // ponawianie flush co 5 s
+const MAX_MEMORY_BUFFER       = 10000;            // limit rekordów w pamięci
+const WAL_CHECKPOINT_BYTES    = 10 * 1024 * 1024; // 10 MB – próg checkpointu
+const WAL_CHECKPOINT_INTERVAL = 60;               // minimalny odstęp checkpointu (s)
+const WAL_CHECKPOINT_FORCE    = 300;              // wymuś checkpoint po 5 min
 
-// Maksymalna liczba rekordów trzymanych w buforze pamięciowym
-const MAX_MEMORY_BUFFER = 10000;
+const CLIENT_IDLE_TIMEOUT = 300;                  // 5 minut bezczynności
 
-// ==================== INICJALIZACJA ====================
+// ==================== STAN GLOBALNY ====================
 if (!is_dir(WAL_DIR)) {
-    mkdir(WAL_DIR, 0755, true);
+    @mkdir(WAL_DIR, 0755, true);
 }
 
-$memoryBuffer = [];        // Bufor rekordów, których nie udało się zapisać do bazy
-$lastDbRetry = 0;          // Timestamp ostatniej próby ponownego połączenia z bazą
+/** @var array<string, array{fields:array, conn:string, ts:float}> */
+$memoryBuffer      = [];   // klucz => rekord
+$lastDbRetry       = 0;
+$lastWalCheckpoint = 0;
+$shutdown          = false;
+
+// ==================== OBSŁUGA SYGNAŁÓW ====================
+if (function_exists('pcntl_async_signals')) {
+    pcntl_async_signals(true);
+    $handler = function (int $signo) use (&$shutdown): void {
+        echo "[SYGNAŁ] Otrzymano $signo – zamykanie...\n";
+        $shutdown = true;
+    };
+    @pcntl_signal(SIGTERM, $handler);
+    @pcntl_signal(SIGINT, $handler);
+}
 
 // ==================== WARSTWA TRWAŁOŚCI ====================
-
-/**
- * Zwraca połączenie PDO z bazą danych.
- * W przypadku awarii próbuje ponownie.
- */
 function getPDO(): ?PDO
 {
     static $pdo = null;
@@ -59,7 +74,6 @@ function getPDO(): ?PDO
             $pdo->query('SELECT 1');
             return $pdo;
         } catch (PDOException $e) {
-            // Połączenie nieaktualne — spróbuj ponownie
             $pdo = null;
         }
     }
@@ -69,16 +83,11 @@ function getPDO(): ?PDO
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
-            PDO::ATTR_PERSISTENT         => true,
             PDO::ATTR_TIMEOUT            => 5,
         ]);
-
-        // Wymuś pełną trwałość na poziomie sesji (ACID)
-        // innodb_flush_log_at_trx_commit = 1 oznacza flush redo log na każdy commit
         $pdo->exec("SET SESSION innodb_flush_log_at_trx_commit = 1");
         $pdo->exec("SET SESSION sync_binlog = 1");
         $pdo->exec("SET SESSION wait_timeout = 28800");
-
         return $pdo;
     } catch (PDOException $e) {
         error_log("[DB] Błąd połączenia: " . $e->getMessage());
@@ -87,322 +96,375 @@ function getPDO(): ?PDO
 }
 
 /**
- * Zwraca unikatowy identyfikator rekordu do wykrywania powtórzeń.
+ * Klucz rekordu — teraz uwzględnia connection_id, żeby dwa różne
+ * strumienie mogły niezależnie raportować ten sam odczyt.
  */
 function observationKey(array $fields, string $connectionId): string
 {
-    $sequence = (string) ($fields[1] ?? '');
-    $tag      = (string) ($fields[2] ?? '');
-    $reader   = (string) ($fields[6] ?? '');
-    $time     = (string) ($fields[5] ?? '');
-
-    return $sequence . '|' . $tag . '|' . $reader . '|' . $time;
+    return implode('|', [
+        (string) ($fields[1] ?? ''),
+        (string) ($fields[2] ?? ''),
+        (string) ($fields[6] ?? ''),
+        (string) ($fields[5] ?? ''),
+        $connectionId,
+    ]);
 }
 
 /**
- * Dodaje rekord do bufora pamięciowego z ochroną przed duplikatami.
+ * Walidacja ramki TO~:
+ *  - co najmniej 11 pól,
+ *  - indeksy 1, 5, 7, 8, 9 muszą być liczbowe.
  */
+function validateFields(array $fields): bool
+{
+    if (count($fields) < 11) return false;
+    foreach ([1, 5, 7, 8, 9] as $i) {
+        if (!isset($fields[$i]) || !is_numeric($fields[$i])) return false;
+    }
+    return true;
+}
+
 function enqueueMemoryRecord(array $fields, string $connectionId): void
 {
     global $memoryBuffer;
-
     $key = observationKey($fields, $connectionId);
-    foreach ($memoryBuffer as $item) {
-        if (observationKey($item['fields'], (string) $item['conn']) === $key) {
-            return;
-        }
-    }
+    if (isset($memoryBuffer[$key])) return;
 
-    $memoryBuffer[] = ['fields' => $fields, 'conn' => $connectionId, 'ts' => microtime(true)];
+    $memoryBuffer[$key] = [
+        'fields' => $fields,
+        'conn'   => $connectionId,
+        'ts'     => microtime(true),
+    ];
 
-    if (count($memoryBuffer) > MAX_MEMORY_BUFFER) {
-        array_shift($memoryBuffer);
+    while (count($memoryBuffer) > MAX_MEMORY_BUFFER) {
+        $firstKey = array_key_first($memoryBuffer);
+        if ($firstKey === null) break;
+        unset($memoryBuffer[$firstKey]);
         error_log("[DB] Bufor pamięciowy przepełniony — najstarszy rekord odrzucony.");
     }
 }
 
 /**
- * Zapisuje pojedynczy odczyt do WAL (Write-Ahead Log) na dysku.
- * Używa O_APPEND i fsync, aby zapewnić trwałość nawet przy nagłej utracie zasilania.
- *
- * @return bool True, jeśli zapis się powiódł.
+ * Zapis do WAL w formacie JSON-lines. Zapewnia trwałość i odporne
+ * parsowanie (znaki ~ i \ w polach nie psują struktury).
  */
 function writeToWAL(array $fields, string $connectionId): bool
 {
-    $line = implode('~', $fields) . '~' . $connectionId . "\n";
+    $payload = json_encode(
+        ['f' => $fields, 'c' => $connectionId, 't' => time()],
+        JSON_UNESCAPED_UNICODE
+    );
+    if ($payload === false) {
+        error_log("[WAL] Błąd serializacji JSON.");
+        return false;
+    }
 
     $fh = @fopen(WAL_FILE, 'ab');
     if ($fh === false) {
         error_log("[WAL] Nie można otworzyć pliku WAL: " . WAL_FILE);
         return false;
     }
-
-    // Blokada zapisu — zapobiega przeplataniu się rekordów przy wielu procesach
     if (!flock($fh, LOCK_EX)) {
         fclose($fh);
         error_log("[WAL] Nie można założyć blokady na plik WAL.");
         return false;
     }
 
-    $written = fwrite($fh, $line);
+    $written = fwrite($fh, $payload . "\n");
     fflush($fh);
-
-    // Wymuś zapis na fizycznym nośniku (fsync)
-    // Bez tego dane mogą pozostać w cache systemu plików i zginąć przy awarii zasilania.
     if (function_exists('fsync')) {
-        fsync($fh);
+        @fsync($fh);
     }
-
     flock($fh, LOCK_UN);
     fclose($fh);
 
     return $written !== false && $written > 0;
 }
 
-/**
- * Zapisuje odczyt do bazy danych.
- * Jeśli baza jest niedostępna, dodaje rekord do bufora pamięciowego.
- */
+function buildInsertStatement(PDO $pdo): PDOStatement
+{
+    return $pdo->prepare(
+        "INSERT IGNORE INTO tag_observations
+           (sequence_number, tag_code, timer_code, event_code,
+            observation_time, reader_id, port_number, rssi,
+            reader_sequence, transaction_type, connection_id)
+         VALUES
+           (:seq, :tag, :timer, :event,
+            :time, :reader, :port, :rssi,
+            :rseq, :type, :conn)"
+    );
+}
+
+function bindAndExecute(PDOStatement $stmt, array $fields, string $connectionId): void
+{
+    $stmt->execute([
+        ':seq'    => (int)   $fields[1],
+        ':tag'    => (string) $fields[2],
+        ':timer'  => (string) $fields[3],
+        ':event'  => (string) $fields[4],
+        ':time'   => (float) $fields[5],
+        ':reader' => (string) $fields[6],
+        ':port'   => (int)   $fields[7],
+        ':rssi'   => (int)   $fields[8],
+        ':rseq'   => (int)   $fields[9],
+        ':type'   => (string) $fields[10],
+        ':conn'   => $connectionId,
+    ]);
+}
+
 function persistObservation(array $fields, string $connectionId): void
 {
     global $memoryBuffer;
 
-    // Krok 1: Zawsze zapisz do WAL jako pierwszy krok (trwałość na dysku)
-    $walOk = writeToWAL($fields, $connectionId);
-    if (!$walOk) {
-        error_log("[KRYTYCZNY] Nie udało się zapisać do WAL. Rekord pozostaje tylko w pamięci.");
+    if (!validateFields($fields)) {
+        error_log("[WALIDACJA] Nieprawidłowa ramka TO: " . substr(implode('~', $fields), 0, 200));
+        return;
     }
 
-    // Krok 2: Spróbuj zapisać do bazy
+    // 1. WAL — trwałość na dysku
+    if (!writeToWAL($fields, $connectionId)) {
+        error_log("[KRYTYCZNY] Nie udało się zapisać do WAL.");
+    }
+
+    // 2. Baza
     $pdo = getPDO();
     if ($pdo === null) {
         enqueueMemoryRecord($fields, $connectionId);
-        error_log("[DB] Baza niedostępna. Rekord w buforze pamięciowym. Bufor: " . count($memoryBuffer));
+        error_log("[DB] Baza niedostępna. Bufor: " . count($memoryBuffer));
         return;
     }
 
     try {
-        $sql = "INSERT IGNORE INTO tag_observations
-                (sequence_number, tag_code, timer_code, event_code,
-                 observation_time, reader_id, port_number, rssi,
-                 reader_sequence, transaction_type, connection_id)
-                VALUES
-                (:seq, :tag, :timer, :event,
-                 :time, :reader, :port, :rssi,
-                 :rseq, :type, :conn)";
-
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute([
-            ':seq'    => (int) $fields[1],
-            ':tag'    => $fields[2],
-            ':timer'  => $fields[3],
-            ':event'  => $fields[4],
-            ':time'   => (float) $fields[5],
-            ':reader' => $fields[6],
-            ':port'   => (int) $fields[7],
-            ':rssi'   => (int) $fields[8],
-            ':rseq'   => (int) $fields[9],
-            ':type'   => $fields[10],
-            ':conn'   => $connectionId,
-        ]);
-
+        bindAndExecute(buildInsertStatement($pdo), $fields, $connectionId);
         echo "[ZAPIS] Tag: {$fields[2]} | Czas: {$fields[5]}\n";
-
-        // Krok 3: Jeśli w buforze są rekordy, spróbuj je teraz opróżnić
-        if (!empty($memoryBuffer)) {
-            flushMemoryBuffer($pdo);
-        }
     } catch (PDOException $e) {
         error_log("[DB] Błąd INSERT: " . $e->getMessage());
         enqueueMemoryRecord($fields, $connectionId);
+        return;
     }
 
-    if (count($memoryBuffer) > MAX_MEMORY_BUFFER) {
-        array_shift($memoryBuffer);
-        error_log("[DB] Bufor pamięciowy przepełniony — najstarszy rekord odrzucony.");
+    // 3. Opróżnij bufor (jeśli coś zalega)
+    if (!empty($memoryBuffer)) {
+        flushMemoryBuffer($pdo);
     }
 }
 
-/**
- * Próbuje zapisać wszystkie rekordy z bufora pamięciowego do bazy.
- */
 function flushMemoryBuffer(PDO $pdo): void
 {
     global $memoryBuffer;
-
     if (empty($memoryBuffer)) return;
 
-    $sql = "INSERT IGNORE INTO tag_observations
-            (sequence_number, tag_code, timer_code, event_code,
-             observation_time, reader_id, port_number, rssi,
-             reader_sequence, transaction_type, connection_id)
-            VALUES
-            (:seq, :tag, :timer, :event,
-             :time, :reader, :port, :rssi,
-             :rseq, :type, :conn)";
-
-    $stmt = $pdo->prepare($sql);
+    $stmt    = buildInsertStatement($pdo);
     $flushed = 0;
-    $remaining = [];
-    $seen = [];
 
-    foreach ($memoryBuffer as $item) {
-        $f = $item['fields'];
-        $key = observationKey($f, (string) $item['conn']);
-
-        if (isset($seen[$key])) {
-            continue;
-        }
-        $seen[$key] = true;
-
+    foreach ($memoryBuffer as $key => $item) {
         try {
-            $stmt->execute([
-                ':seq'    => (int) $f[1],
-                ':tag'    => $f[2],
-                ':timer'  => $f[3],
-                ':event'  => $f[4],
-                ':time'   => (float) $f[5],
-                ':reader' => $f[6],
-                ':port'   => (int) $f[7],
-                ':rssi'   => (int) $f[8],
-                ':rseq'   => (int) $f[9],
-                ':type'   => $f[10],
-                ':conn'   => $item['conn'],
-            ]);
+            bindAndExecute($stmt, $item['fields'], (string) $item['conn']);
+            unset($memoryBuffer[$key]);
             $flushed++;
         } catch (PDOException $e) {
-            $remaining[] = $item;
+            // rekord zostaje w buforze i będzie ponowiony przy następnym flushu
         }
     }
 
-    $memoryBuffer = $remaining;
     if ($flushed > 0) {
-        error_log("[DB] Opróżniono bufor: $flushed rekordów zapisanych, " . count($memoryBuffer) . " pozostało.");
+        error_log("[DB] Opróżniono bufor: $flushed rekordów, pozostało: " . count($memoryBuffer));
     }
 }
 
-/**
- * Próbuje ponownie wysłać bufory do bazy według interwału retry.
- */
 function maybeRetryDbFlush(): void
 {
     global $lastDbRetry, $memoryBuffer;
 
-    if (empty($memoryBuffer)) {
-        return;
-    }
-
+    if (empty($memoryBuffer)) return;
     $now = time();
-    if (($now - $lastDbRetry) < DB_RETRY_INTERVAL) {
-        return;
-    }
-
+    if (($now - $lastDbRetry) < DB_RETRY_INTERVAL) return;
     $lastDbRetry = $now;
-    $pdo = getPDO();
-    if ($pdo === null) {
-        return;
-    }
 
+    $pdo = getPDO();
+    if ($pdo === null) return;
     flushMemoryBuffer($pdo);
 }
 
 /**
- * Odtwarza dane z pliku WAL po restarcie serwera.
- * Wywoływana jednorazowo przy starcie — próbuje wstawić ewentualne
- * rekordy, które zostały zapisane do WAL, ale nie trafiły do bazy.
+ * Okresowy checkpoint WAL — odtwarza (INSERT IGNORE) wszystkie wpisy
+ * z pliku i czyści go, jeśli wszystkie operacje się powiodły.
+ * Bezpieczne: proces jest jednowątkowy, więc pomiędzy odczytem
+ * a truncate nie zostaną dopisane nowe rekordy.
+ */
+function checkpointWAL(): void
+{
+    if (!file_exists(WAL_FILE)) return;
+
+    $lines = @file(WAL_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false || empty($lines)) return;
+
+    $pdo = getPDO();
+    if ($pdo === null) {
+        error_log("[WAL] Checkpoint pominięty — baza niedostępna.");
+        return;
+    }
+
+    $stmt      = buildInsertStatement($pdo);
+    $persisted = 0;
+    $errors    = 0;
+
+    foreach ($lines as $line) {
+        $record = json_decode($line, true);
+        if (!is_array($record) || !isset($record['f']) || !is_array($record['f'])) {
+            continue;
+        }
+        $fields = $record['f'];
+        $connId = (string) ($record['c'] ?? '');
+        if (!validateFields($fields)) continue;
+
+        try {
+            bindAndExecute($stmt, $fields, $connId);
+            $persisted++;
+        } catch (PDOException $e) {
+            $errors++;
+        }
+    }
+
+    if ($errors === 0) {
+        file_put_contents(WAL_FILE, '', LOCK_EX);
+        error_log("[WAL] Checkpoint OK: $persisted wpisów, plik wyczyszczony.");
+    } else {
+        error_log("[WAL] Checkpoint częściowy: $persisted OK, $errors błędów — plik pozostawiony.");
+    }
+}
+
+function maybeCheckpointWAL(): void
+{
+    global $lastWalCheckpoint;
+
+    $now     = time();
+    $elapsed = $now - $lastWalCheckpoint;
+    if ($elapsed < WAL_CHECKPOINT_INTERVAL) return;
+
+    if (!file_exists(WAL_FILE)) {
+        $lastWalCheckpoint = $now;
+        return;
+    }
+    $size = @filesize(WAL_FILE);
+    if ($size === false || $size === 0) {
+        $lastWalCheckpoint = $now;
+        return;
+    }
+
+    // Checkpoint gdy plik duży LUB gdy minęło dużo czasu (nawet mały plik).
+    if ($size < WAL_CHECKPOINT_BYTES && $elapsed < WAL_CHECKPOINT_FORCE) {
+        return;
+    }
+
+    $lastWalCheckpoint = $now;
+    checkpointWAL();
+}
+
+/**
+ * Odtworzenie WAL po starcie — próbuje wstawić wszystkie wpisy
+ * do bazy i czyści plik tylko przy pełnym sukcesie.
  */
 function recoverFromWAL(): void
 {
     if (!file_exists(WAL_FILE)) return;
 
-    $lines = file(WAL_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    if (empty($lines)) return;
+    $lines = @file(WAL_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false || empty($lines)) return;
 
     $pdo = getPDO();
     if ($pdo === null) {
-        error_log("[WAL] Baza niedostępna przy odtwarzaniu. Rekordy z WAL pozostają na dysku.");
+        error_log("[WAL] Baza niedostępna przy odtwarzaniu. Plik pozostaje.");
         return;
     }
 
-    $sql = "INSERT IGNORE INTO tag_observations
-            (sequence_number, tag_code, timer_code, event_code,
-             observation_time, reader_id, port_number, rssi,
-             reader_sequence, transaction_type, connection_id)
-            VALUES
-            (:seq, :tag, :timer, :event,
-             :time, :reader, :port, :rssi,
-             :rseq, :type, :conn)";
-
-    $stmt = $pdo->prepare($sql);
+    $stmt      = buildInsertStatement($pdo);
     $recovered = 0;
+    $errors    = 0;
 
     foreach ($lines as $line) {
-        $parts = explode('~', $line);
-        if (count($parts) < 12) continue;
+        $record = json_decode($line, true);
+        if (!is_array($record) || !isset($record['f']) || !is_array($record['f'])) {
+            continue;
+        }
+        $fields = $record['f'];
+        $connId = (string) ($record['c'] ?? '');
+        if (!validateFields($fields)) continue;
 
         try {
-            $stmt->execute([
-                ':seq'    => (int) $parts[1],
-                ':tag'    => $parts[2],
-                ':timer'  => $parts[3],
-                ':event'  => $parts[4],
-                ':time'   => (float) $parts[5],
-                ':reader' => $parts[6],
-                ':port'   => (int) $parts[7],
-                ':rssi'   => (int) $parts[8],
-                ':rseq'   => (int) $parts[9],
-                ':type'   => $parts[10],
-                ':conn'   => $parts[11] ?? '',
-            ]);
+            bindAndExecute($stmt, $fields, $connId);
             $recovered++;
         } catch (PDOException $e) {
-            // Rekord już istnieje lub błąd — pomiń
+            $errors++;
         }
     }
 
-    if ($recovered > 0) {
-        // Wyczyść WAL po pomyślnym odtworzeniu
-        file_put_contents(WAL_FILE, '');
-        error_log("[WAL] Odtworzono $recovered rekordów z WAL.");
+    if ($errors === 0) {
+        file_put_contents(WAL_FILE, '', LOCK_EX);
+        error_log("[WAL] Odtworzono $recovered rekordów (plik wyczyszczony).");
+    } else {
+        error_log("[WAL] Odtworzono $recovered, $errors błędów — plik pozostawiony.");
     }
 }
 
 // ==================== OBSŁUGA KOMUNIKATÓW CTP01 ====================
-
 function handleLine(string $line, array &$state): ?string
 {
     $line = trim($line);
     if ($line === '') return null;
 
+    // ----- Faza powitania -----
     if ($state['phase'] === 'greeting') {
         if (str_contains($line, 'CTP01')) {
             $state['phase'] = 'initializing';
-            $response = 'PHP-CTP01-Receiver~1.0~3' . "\r\n";
-            $response .= 'stream-mode=push' . "\r\n";
-            $response .= 'location=multi' . "\r\n";
-            $response .= 'guntimes=true' . "\r\n";
-            return $response;
+            return "PHP-CTP01-Receiver~1.0~3\r\n"
+                 . "stream-mode=push\r\n"
+                 . "location=multi\r\n"
+                 . "guntimes=true\r\n";
         }
         return null;
     }
 
+    // ----- Faza inicjalizacji: przejście do active -----
+    if ($state['phase'] === 'initializing') {
+        if (str_starts_with($line, 'getconnectionid')) {
+            $connId = bin2hex(random_bytes(8));
+            $state['connection_id'] = $connId;
+            echo "[CTP01] Przydzielono connection ID: $connId\n";
+            return "ack-getconnectionid~$connId\r\n";
+        }
+        if (str_starts_with($line, 'ack-start')) {
+            $state['phase'] = 'active';
+            echo "[CTP01] Stream uruchomiony.\n";
+            return null;
+        }
+        if (str_starts_with($line, 'err-')) {
+            error_log("[CTP01] Błąd od klienta w inicjalizacji: $line");
+            return null;
+        }
+        // Nieznana linia – logujemy, ale nie przerywamy
+        error_log("[CTP01] Nieoczekiwana linia w inicjalizacji: " . substr($line, 0, 100));
+        return null;
+    }
+
+    // ----- Faza aktywnego strumienia -----
     if ($state['phase'] === 'active') {
         if (str_starts_with($line, 'TO~')) {
             $fields = explode('~', $line);
             if (count($fields) >= 11) {
                 persistObservation($fields, $state['connection_id'] ?? '');
+            } else {
+                error_log("[CTP01] Ramka TO zbyt krótka: " . count($fields) . " pól");
             }
             return null;
         }
-
-        if ($line === 'ack-start' || str_starts_with($line, 'ack-start')) {
-            echo "[CTP01] Stream uruchomiony.\n";
-            return null;
+        if (str_starts_with($line, 'getconnectionid')) {
+            $connId = bin2hex(random_bytes(8));
+            $state['connection_id'] = $connId;
+            return "ack-getconnectionid~$connId\r\n";
         }
-        if (str_starts_with($line, 'ack-getconnectionid')) {
-            $parts = explode('~', $line);
-            $state['connection_id'] = $parts[1] ?? '';
-            echo "[CTP01] Connection ID: {$state['connection_id']}\n";
+        if (str_starts_with($line, 'ack-start')) {
+            echo "[CTP01] Ponowne potwierdzenie startu.\n";
             return null;
         }
         if (str_starts_with($line, 'err-')) {
@@ -414,9 +476,7 @@ function handleLine(string $line, array &$state): ?string
     return null;
 }
 
-// ==================== GŁÓWNA PĘTLA SERWERA ====================
-
-// Odtwórz ewentualne dane z WAL przed rozpoczęciem nasłuchu
+// ==================== START SERWERA ====================
 recoverFromWAL();
 
 $server = stream_socket_server(
@@ -434,18 +494,33 @@ echo "Serwer CTP01 nasłuchuje na " . LISTEN_HOST . ":" . LISTEN_PORT . "\n";
 
 $clients = [];
 
-while (true) {
+while (!$shutdown) {
     maybeRetryDbFlush();
+    maybeCheckpointWAL();
+
+    // Zamknięcie bezczynnych klientów
+    $now = time();
+    foreach ($clients as $sock => $data) {
+        if ($now - $data['last_activity'] > CLIENT_IDLE_TIMEOUT) {
+            echo "[TIMEOUT] Klient bezczynny > " . CLIENT_IDLE_TIMEOUT . "s — zamykanie.\n";
+            @fclose($sock);
+            unset($clients[$sock]);
+        }
+    }
 
     $read = [$server];
-    foreach ($clients as $sock => $data) {
+    foreach ($clients as $sock => $_) {
         $read[] = $sock;
     }
-    $write = null;
+    $write  = null;
     $except = null;
 
-    if (stream_select($read, $write, $except, 0, 200000) === false) {
-        break;
+    $ret = @stream_select($read, $write, $except, 0, 200000);
+    if ($ret === false) {
+        if ($shutdown) break;
+        // Chwilowy błąd / EINTR — nie kręć się w pętli
+        usleep(100000);
+        continue;
     }
 
     // Nowe połączenie
@@ -454,8 +529,9 @@ while (true) {
         if ($client !== false) {
             stream_set_blocking($client, false);
             $clients[$client] = [
-                'buffer' => '',
-                'state'  => [
+                'buffer'        => '',
+                'last_activity' => time(),
+                'state'         => [
                     'phase'         => 'greeting',
                     'connection_id' => null,
                 ],
@@ -471,13 +547,15 @@ while (true) {
 
         $chunk = @fread($sock, 8192);
         if ($chunk === '' || $chunk === false) {
-            echo "[ROZŁĄCZENIE] Klient rozłączony.\n";
-            fclose($sock);
+            $name = @stream_socket_get_name($sock, true);
+            echo "[ROZŁĄCZENIE] Klient rozłączony" . ($name ? ": $name" : '') . ".\n";
+            @fclose($sock);
             unset($clients[$sock]);
             continue;
         }
 
-        $clients[$sock]['buffer'] .= $chunk;
+        $clients[$sock]['last_activity'] = time();
+        $clients[$sock]['buffer']       .= $chunk;
 
         while (($pos = strpos($clients[$sock]['buffer'], "\r\n")) !== false) {
             $line = substr($clients[$sock]['buffer'], 0, $pos);
@@ -490,3 +568,27 @@ while (true) {
         }
     }
 }
+
+// ==================== ZAMYKANIE ====================
+echo "[ZAMYKANIE] Zatrzymywanie serwera...\n";
+
+// Best effort: spróbuj opróżnić bufor pamięci do bazy przed wyjściem
+if (!empty($memoryBuffer)) {
+    $pdo = getPDO();
+    if ($pdo !== null) {
+        flushMemoryBuffer($pdo);
+    }
+    if (!empty($memoryBuffer)) {
+        error_log(
+            "[ZAMYKANIE] " . count($memoryBuffer) .
+            " rekordów pozostało w buforze pamięci (kopia bezpieczeństwa jest w WAL)."
+        );
+    }
+}
+
+foreach ($clients as $sock => $_) {
+    @fclose($sock);
+}
+@fclose($server);
+
+echo "[ZAMYKANIE] Zakończono.\n";
